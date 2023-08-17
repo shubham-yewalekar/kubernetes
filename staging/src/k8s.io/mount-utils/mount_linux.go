@@ -55,6 +55,11 @@ const (
 	errNotMounted = "not mounted"
 )
 
+var (
+	// Error statx support since Linux 4.11, https://man7.org/linux/man-pages/man2/statx.2.html
+	errStatxNotSupport = errors.New("the statx syscall is not supported. At least Linux kernel 4.11 is needed")
+)
+
 // Mounter provides the default implementation of mount.Interface
 // for the linux platform.  This implementation assumes that the
 // kubelet is running in the host's root mount namespace.
@@ -385,28 +390,57 @@ func (*Mounter) List() ([]MountPoint, error) {
 	return ListProcMounts(procMountsPath)
 }
 
+func statx(file string) (unix.Statx_t, error) {
+	var stat unix.Statx_t
+	if err := unix.Statx(0, file, unix.AT_STATX_DONT_SYNC, 0, &stat); err != nil {
+		if err == unix.ENOSYS {
+			return stat, errStatxNotSupport
+		}
+
+		return stat, err
+	}
+
+	return stat, nil
+}
+
 // IsLikelyNotMountPoint determines if a directory is not a mountpoint.
 // It is fast but not necessarily ALWAYS correct. If the path is in fact
 // a bind mount from one part of a mount to another it will not be detected.
 // It also can not distinguish between mountpoints and symbolic links.
 // mkdir /tmp/a /tmp/b; mount --bind /tmp/a /tmp/b; IsLikelyNotMountPoint("/tmp/b")
-// will return true. When in fact /tmp/b is a mount point. If this situation
-// is of interest to you, don't use this function...
+// will return false. When in fact /tmp/b is a mount point.
 func (mounter *Mounter) IsLikelyNotMountPoint(file string) (bool, error) {
-	stat, err := os.Stat(file)
-	if err != nil {
-		return true, err
-	}
-	rootStat, err := os.Stat(filepath.Dir(strings.TrimSuffix(file, "/")))
-	if err != nil {
-		return true, err
-	}
-	// If the directory has a different device as parent, then it is a mountpoint.
-	if stat.Sys().(*syscall.Stat_t).Dev != rootStat.Sys().(*syscall.Stat_t).Dev {
-		return false, nil
+	var stat, rootStat unix.Statx_t
+	var err error
+
+	if stat, err = statx(file); err != nil {
+		if errors.Is(err, errStatxNotSupport) {
+			// not support statx, go slow path
+			mnt, mntErr := mounter.IsMountPoint(file)
+			return !mnt, mntErr
+		}
+
+		return false, err
 	}
 
-	return true, nil
+	if stat.Attributes_mask != 0 {
+		if stat.Attributes_mask&unix.STATX_ATTR_MOUNT_ROOT != 0 {
+			if stat.Attributes&unix.STATX_ATTR_MOUNT_ROOT != 0 {
+				// file is a mountpoint
+				return false, nil
+			} else {
+				// no need to check rootStat if unix.STATX_ATTR_MOUNT_ROOT supported
+				return true, nil
+			}
+		}
+	}
+
+	root := filepath.Dir(strings.TrimSuffix(file, "/"))
+	if rootStat, err = statx(root); err != nil {
+		return false, err
+	}
+
+	return !(stat.Dev_major == rootStat.Dev_major && stat.Dev_minor == rootStat.Dev_minor), nil
 }
 
 // CanSafelySkipMountPointCheck relies on the detected behavior of umount when given a target that is not a mount point.
