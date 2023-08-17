@@ -33,7 +33,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/moby/sys/mountinfo"
 
 	utilio "k8s.io/utils/io"
 	"golang.org/x/sys/unix"
@@ -58,6 +57,11 @@ const (
 	errNoChildProcesses = "wait: no child processes"
 	// Error returned by some `umount` implementations when the specified path is not a mount point
 	errNotMounted = "not mounted"
+)
+
+var (
+	// Error statx support since Linux 4.11, https://man7.org/linux/man-pages/man2/statx.2.html
+	errStatxNotSupport = errors.New("the statx syscall is not supported. At least Linux kernel 4.11 is needed")
 )
 
 // Mounter provides the default implementation of mount.Interface
@@ -425,7 +429,23 @@ func (mounter *Mounter) isLikelyNotMountPointStatx(file string) (bool, error) {
 	var err error
 
 	if stat, err = statx(file); err != nil {
-		return true, err
+		if errors.Is(err, errStatxNotSupport) {
+			// not support statx, go slow path
+			mnt, mntErr := mounter.IsMountPoint(file)
+			return !mnt, mntErr
+		}
+	}
+
+	if stat.Attributes_mask != 0 {
+		if stat.Attributes_mask&unix.STATX_ATTR_MOUNT_ROOT != 0 {
+			if stat.Attributes&unix.STATX_ATTR_MOUNT_ROOT != 0 {
+				// file is a mountpoint
+				return false, nil
+			} else {
+				// no need to check rootStat if unix.STATX_ATTR_MOUNT_ROOT supported
+				return true, nil
+			}
+		}
 	}
 
 	if stat.Attributes_mask != 0 {
