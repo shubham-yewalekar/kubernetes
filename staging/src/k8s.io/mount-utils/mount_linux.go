@@ -403,13 +403,24 @@ func statx(file string) (unix.Statx_t, error) {
 	return stat, nil
 }
 
-// IsLikelyNotMountPoint determines if a directory is not a mountpoint.
-// It is fast but not necessarily ALWAYS correct. If the path is in fact
-// a bind mount from one part of a mount to another it will not be detected.
-// It also can not distinguish between mountpoints and symbolic links.
-// mkdir /tmp/a /tmp/b; mount --bind /tmp/a /tmp/b; IsLikelyNotMountPoint("/tmp/b")
-// will return false. When in fact /tmp/b is a mount point.
-func (mounter *Mounter) IsLikelyNotMountPoint(file string) (bool, error) {
+func (mounter *Mounter) isLikelyNotMountPointStat(file string) (bool, error) {
+	stat, err := os.Stat(file)
+	if err != nil {
+		return true, err
+	}
+	rootStat, err := os.Stat(filepath.Dir(strings.TrimSuffix(file, "/")))
+	if err != nil {
+		return true, err
+	}
+	// If the directory has a different device as parent, then it is a mountpoint.
+	if stat.Sys().(*syscall.Stat_t).Dev != rootStat.Sys().(*syscall.Stat_t).Dev {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+func (mounter *Mounter) isLikelyNotMountPointStatx(file string) (bool, error) {
 	var stat, rootStat unix.Statx_t
 	var err error
 
@@ -441,6 +452,23 @@ func (mounter *Mounter) IsLikelyNotMountPoint(file string) (bool, error) {
 	}
 
 	return !(stat.Dev_major == rootStat.Dev_major && stat.Dev_minor == rootStat.Dev_minor), nil
+}
+
+// IsLikelyNotMountPoint determines if a directory is not a mountpoint.
+// It is fast but not necessarily ALWAYS correct. If the path is in fact
+// a bind mount from one part of a mount to another it will not be detected.
+// It also can not distinguish between mountpoints and symbolic links.
+// mkdir /tmp/a /tmp/b; mount --bind /tmp/a /tmp/b; IsLikelyNotMountPoint("/tmp/b")
+// will return true. When in fact /tmp/b is a mount point. If this situation
+// is of interest to you, don't use this function...
+func (mounter *Mounter) IsLikelyNotMountPoint(file string) (bool, error) {
+	notMountPoint, err := mounter.isLikelyNotMountPointStatx(file)
+	if errors.Is(err, errStatxNotSupport) {
+		// fall back to isLikelyNotMountPointStat
+		return mounter.isLikelyNotMountPointStat(file)
+	}
+
+	return notMountPoint, err
 }
 
 // CanSafelySkipMountPointCheck relies on the detected behavior of umount when given a target that is not a mount point.
